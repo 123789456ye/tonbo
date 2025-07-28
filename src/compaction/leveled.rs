@@ -1,76 +1,171 @@
-use std::{cmp, collections::Bound, mem, sync::Arc};
+use std::cmp;
+use std::mem;
+use std::ops::Bound;
+use std::sync::Arc;
 
 use async_lock::{RwLock, RwLockUpgradableReadGuard};
 use fusio_parquet::writer::AsyncWriter;
 use parquet::arrow::{AsyncArrowWriter, ProjectionMask};
+use ulid::Ulid;
 
-use super::Compactor;
+use super::{CompactionError, Compactor};
+use crate::compaction::RecordSchema;
+use crate::fs::manager::StoreManager;
+use crate::fs::{generate_file_id, FileId, FileType};
+use crate::inmem::immutable::Immutable;
+use crate::inmem::mutable::MutableMemTable;
+use crate::ondisk::sstable::{SsTable, SsTableID};
+use crate::scope::Scope;
+use crate::stream::level::LevelStream;
+use crate::stream::ScanStream;
+use crate::version::edit::VersionEdit;
+use crate::version::TransactionTs;
 use crate::{
-    compaction::CompactionError,
     context::Context,
-    fs::{generate_file_id, manager::StoreManager, FileId, FileType},
-    inmem::{immutable::Immutable, mutable::MutableMemTable},
-    ondisk::sstable::{SsTable, SsTableID},
-    record::{Record, Schema as RecordSchema},
-    scope::Scope,
-    stream::{level::LevelStream, ScanStream},
-    version::{edit::VersionEdit, TransactionTs, Version, MAX_LEVEL},
+    record::{self, Record},
+    version::{Version, MAX_LEVEL},
     DbOption, DbStorage,
 };
 
-/// A compactor that enforces a leveled compaction strategy over all SST levels.
-///
-/// The `LeveledCompactor` drives both minor flush‐to‐level‐0 compactions and
-/// multi‐level major compactions, combining SST files up through the levels.
-/// It combines immutable memtables into sorted SSTs (minor compaction), then
-/// repeatedly merges overlapping SSTs across adjacent levels (major compaction):
-///
-/// 1. Minor compaction (level 0):
-///    - Converts the current in‑memory memtable into one or more SST files
-///    - Ensures L0 does not grow unbounded by merging small SSTs once their count exceeds a
-///      configured chunk size
-///
-/// 2. Major compaction (levels ≥ 1):
-///    - Scans all SSTs in level L that overlap a given key range, plus any overlapping SSTs in
-///      level L+1
-///    - Merges and rewrites them into new SSTs in level L+1, bounded by size thresholds
-///    - Deletes the old SST files from both levels after the new files are safely written
-///
-/// This is currently the main way Tonbo does compaction
-pub(crate) struct LeveledCompactor<R>
-where
-    R: Record,
-{
+pub struct LeveledTask {
+    pub input: Vec<(usize, Vec<Ulid>)>,
+}
+
+pub struct LeveledCompactor<R: Record> {
     option: Arc<DbOption>,
     schema: Arc<RwLock<DbStorage<R>>>,
     ctx: Arc<Context<R>>,
     record_schema: Arc<R::Schema>,
 }
 
-impl<R> LeveledCompactor<R>
+impl<R> Compactor<R> for LeveledCompactor<R>
 where
     R: Record,
+    <<R as record::Record>::Schema as record::Schema>::Columns: Send + Sync,
 {
-    /// Create new instance of `LeveledCompactor`
-    pub(crate) fn new(
-        schema: Arc<RwLock<DbStorage<R>>>,
-        record_schema: Arc<R::Schema>,
-        option: Arc<DbOption>,
-        ctx: Arc<Context<R>>,
-    ) -> Self {
-        LeveledCompactor::<R> {
-            option,
-            schema,
-            ctx,
-            record_schema,
+    type Task = LeveledTask;
+
+    async fn check_then_compaction(&self, is_manual: bool) -> Result<(), CompactionError<R>> {
+        self.minor_flush(is_manual).await?;
+        while self.should_major_compact().await {
+            if let Some(task) = self.plan_major().await {
+                self.execute_major(task).await?;
+            } else {
+                break;
+            }
         }
+
+        if is_manual {
+            self.ctx.version_set.rewrite().await.unwrap();
+        }
+
+        Ok(())
     }
 
-    /// Flushes the current memtable into an immutable SST and triggers compaction as needed.
-    pub(crate) async fn check_then_compaction(
-        &mut self,
-        is_manual: bool,
+    async fn should_major_compact(&self) -> bool {
+        // Check if any level needs major compaction
+        let version_ref = self.ctx.version_set.current().await;
+        for level in 0..MAX_LEVEL - 2 {
+            if Self::is_threshold_exceeded_major(&self.option, &version_ref, level) {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn plan_major(&self) -> Option<<Self as Compactor<R>>::Task> {
+        let version_ref = self.ctx.version_set.current().await;
+
+        // Find the first level that needs compaction
+        for level in 0..MAX_LEVEL - 2 {
+            if Self::is_threshold_exceeded_major(&self.option, &version_ref, level) {
+                // Collect file IDs from the level that needs compaction
+                let level_files: Vec<Ulid> = version_ref.level_slice[level]
+                    .iter()
+                    .map(|scope| scope.gen)
+                    .collect();
+
+                if !level_files.is_empty() {
+                    let mut input = vec![(level, level_files)];
+                    if level + 1 < MAX_LEVEL {
+                        let next_level_files: Vec<Ulid> = version_ref.level_slice[level + 1]
+                            .iter()
+                            .map(|scope| scope.gen)
+                            .collect();
+
+                        if !next_level_files.is_empty() {
+                            input.push((level + 1, next_level_files));
+                        }
+                    }
+                    return Some(LeveledTask { input });
+                }
+            }
+        }
+        None
+    }
+
+    async fn execute_major(
+        &self,
+        task: <Self as Compactor<R>>::Task,
     ) -> Result<(), CompactionError<R>> {
+        let version_ref = self.ctx.version_set.current().await;
+        let mut version_edits = vec![];
+        let mut delete_gens = vec![];
+
+        // Extract the level from the task
+        for (level, file_gens) in &task.input {
+            if file_gens.is_empty() {
+                continue;
+            }
+
+            // Get the scopes for the files to be compacted
+            let level_scopes: Vec<&Scope<_>> = version_ref.level_slice[*level]
+                .iter()
+                .filter(|scope| file_gens.contains(&scope.gen))
+                .collect();
+
+            if level_scopes.is_empty() {
+                continue;
+            }
+
+            // Determine min/max range for compaction
+            let min = level_scopes.iter().map(|scope| &scope.min).min().unwrap();
+            let max = level_scopes.iter().map(|scope| &scope.max).max().unwrap();
+            // Execute the actual compaction logic
+            Self::major_compaction(
+                &version_ref,
+                &self.option,
+                &min,
+                &max,
+                &mut version_edits,
+                &mut delete_gens,
+                &self.record_schema,
+                &self.ctx,
+                task.input[0].0,
+            )
+            .await?;
+
+            break; // Process one level at a time
+        }
+
+        if !version_edits.is_empty() {
+            version_edits.push(VersionEdit::LatestTimeStamp {
+                ts: version_ref.increase_ts(),
+            });
+
+            self.ctx
+                .version_set
+                .apply_edits(version_edits, Some(delete_gens), false)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn minor_flush(
+        &self,
+        is_manual: bool,
+    ) -> Result<Option<<Self as Compactor<R>>::Task>, CompactionError<R>> {
         let mut guard = self.schema.write().await;
 
         guard.trigger.reset();
@@ -93,7 +188,7 @@ where
             let (file_id, immutable) = mutable.into_immutable().await?;
             guard.immutables.push((file_id, immutable));
         } else if !is_manual {
-            return Ok(());
+            return Ok(None);
         }
 
         if (is_manual && !guard.immutables.is_empty())
@@ -120,40 +215,41 @@ where
             .await?
             {
                 let version_ref = self.ctx.version_set.current().await;
-                let mut version_edits = vec![];
-                let mut delete_gens = vec![];
-
-                if Self::is_threshold_exceeded_major(&self.option, &version_ref, 0) {
-                    Self::major_compaction(
-                        &version_ref,
-                        &self.option,
-                        &scope.min,
-                        &scope.max,
-                        &mut version_edits,
-                        &mut delete_gens,
-                        &guard.record_schema,
-                        &self.ctx,
-                    )
-                    .await?;
-                }
-                version_edits.insert(0, VersionEdit::Add { level: 0, scope });
+                let mut version_edits = vec![VersionEdit::Add { level: 0, scope }];
                 version_edits.push(VersionEdit::LatestTimeStamp {
                     ts: version_ref.increase_ts(),
                 });
 
                 self.ctx
                     .version_set
-                    .apply_edits(version_edits, Some(delete_gens), false)
+                    .apply_edits(version_edits, None, false)
                     .await?;
             }
             let mut guard = RwLockUpgradableReadGuard::upgrade(guard).await;
             let sources = guard.immutables.split_off(chunk_num);
             let _ = mem::replace(&mut guard.immutables, sources);
         }
-        if is_manual {
-            self.ctx.version_set.rewrite().await.unwrap();
+        Ok(None)
+    }
+}
+
+impl<R> LeveledCompactor<R>
+where
+    R: Record,
+    <<R as record::Record>::Schema as record::Schema>::Columns: Send + Sync,
+{
+    pub(crate) fn new(
+        schema: Arc<RwLock<DbStorage<R>>>,
+        record_schema: Arc<R::Schema>,
+        option: Arc<DbOption>,
+        ctx: Arc<Context<R>>,
+    ) -> Self {
+        LeveledCompactor::<R> {
+            option,
+            schema,
+            ctx,
+            record_schema,
         }
-        Ok(())
     }
 
     // Combine immutable memtables into SST file
@@ -235,121 +331,116 @@ where
         delete_gens: &mut Vec<SsTableID>,
         instance: &R::Schema,
         ctx: &Context<R>,
+        target_level: usize,
     ) -> Result<(), CompactionError<R>> {
-        let mut level = 0;
+        let level = target_level;
 
-        while level < MAX_LEVEL - 2 {
-            if !Self::is_threshold_exceeded_major(option, version, level) {
-                break;
-            }
-            let (meet_scopes_l, start_l, end_l) = Self::this_level_scopes(version, min, max, level);
-            let (meet_scopes_ll, start_ll, end_ll) =
-                Self::next_level_scopes(version, &mut min, &mut max, level, &meet_scopes_l)?;
+        let (meet_scopes_l, start_l, end_l) = Self::this_level_scopes(version, min, max, level);
+        let (meet_scopes_ll, start_ll, end_ll) =
+            Self::next_level_scopes(version, &mut min, &mut max, level, &meet_scopes_l)?;
 
-            let level_path = option.level_fs_path(level).unwrap_or(&option.base_path);
-            let level_fs = ctx.manager.get_fs(level_path);
-            let mut streams = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
+        let level_path = option.level_fs_path(level).unwrap_or(&option.base_path);
+        let level_fs = ctx.manager.get_fs(level_path);
+        let mut streams = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
 
-            // Behaviour for level 0 is different as it is unsorted + has overlapping keys
-            if level == 0 {
-                for scope in meet_scopes_l.iter() {
-                    let file = level_fs
-                        .open_options(
-                            &option.table_path(scope.gen, level),
-                            FileType::Parquet.open_options(true),
+        // Behaviour for level 0 is different as it is unsorted + has overlapping keys
+        if level == 0 {
+            for scope in meet_scopes_l.iter() {
+                let file = level_fs
+                    .open_options(
+                        &option.table_path(scope.gen, level),
+                        FileType::Parquet.open_options(true),
+                    )
+                    .await?;
+
+                streams.push(ScanStream::SsTable {
+                    inner: SsTable::open(ctx.parquet_lru.clone(), scope.gen, file)
+                        .await?
+                        .scan(
+                            (Bound::Unbounded, Bound::Unbounded),
+                            u32::MAX.into(),
+                            None,
+                            ProjectionMask::all(),
                         )
-                        .await?;
-
-                    streams.push(ScanStream::SsTable {
-                        inner: SsTable::open(ctx.parquet_lru.clone(), scope.gen, file)
-                            .await?
-                            .scan(
-                                (Bound::Unbounded, Bound::Unbounded),
-                                u32::MAX.into(),
-                                None,
-                                ProjectionMask::all(),
-                            )
-                            .await?,
-                    });
-                }
-            } else {
-                let (lower, upper) = Compactor::<R>::full_scope(&meet_scopes_l)?;
-                let level_scan_l = LevelStream::new(
-                    version,
-                    level,
-                    start_l,
-                    end_l,
-                    (Bound::Included(lower), Bound::Included(upper)),
-                    u32::MAX.into(),
-                    None,
-                    ProjectionMask::all(),
-                    level_fs.clone(),
-                    ctx.parquet_lru.clone(),
-                )
-                .ok_or(CompactionError::EmptyLevel)?;
-
-                streams.push(ScanStream::Level {
-                    inner: level_scan_l,
+                        .await?,
                 });
             }
-
-            let level_l_path = option.level_fs_path(level + 1).unwrap_or(&option.base_path);
-            let level_l_fs = ctx.manager.get_fs(level_l_path);
-
-            // Pushes next level SSTs that fall in the range
-            if !meet_scopes_ll.is_empty() {
-                let (lower, upper) = Compactor::<R>::full_scope(&meet_scopes_ll)?;
-                let level_scan_ll = LevelStream::new(
-                    version,
-                    level + 1,
-                    start_ll,
-                    end_ll,
-                    (Bound::Included(lower), Bound::Included(upper)),
-                    u32::MAX.into(),
-                    None,
-                    ProjectionMask::all(),
-                    level_l_fs.clone(),
-                    ctx.parquet_lru.clone(),
-                )
-                .ok_or(CompactionError::EmptyLevel)?;
-
-                streams.push(ScanStream::Level {
-                    inner: level_scan_ll,
-                });
-            }
-
-            // Build the new SSTs
-            Compactor::<R>::build_tables(
-                option,
-                version_edits,
-                level + 1,
-                streams,
-                instance,
-                level_l_fs,
+        } else {
+            let (lower, upper) = <LeveledCompactor<R> as Compactor<R>>::full_scope(&meet_scopes_l)?;
+            let level_scan_l = LevelStream::new(
+                version,
+                level,
+                start_l,
+                end_l,
+                (Bound::Included(lower), Bound::Included(upper)),
+                u32::MAX.into(),
+                None,
+                ProjectionMask::all(),
+                level_fs.clone(),
+                ctx.parquet_lru.clone(),
             )
-            .await?;
+            .ok_or(CompactionError::EmptyLevel)?;
 
-            // Delete old files on both levels
-            for scope in meet_scopes_l {
-                version_edits.push(VersionEdit::Remove {
-                    level: level as u8,
-                    gen: scope.gen,
-                });
-                delete_gens.push(SsTableID::new(scope.gen, level));
-            }
-            for scope in meet_scopes_ll {
-                version_edits.push(VersionEdit::Remove {
-                    level: (level + 1) as u8,
-                    gen: scope.gen,
-                });
-                delete_gens.push(SsTableID::new(scope.gen, level + 1));
-            }
-            level += 1;
+            streams.push(ScanStream::Level {
+                inner: level_scan_l,
+            });
+        }
+
+        let level_l_path = option.level_fs_path(level + 1).unwrap_or(&option.base_path);
+        let level_l_fs = ctx.manager.get_fs(level_l_path);
+
+        // Pushes next level SSTs that fall in the range
+        if !meet_scopes_ll.is_empty() {
+            let (lower, upper) =
+                <LeveledCompactor<R> as Compactor<R>>::full_scope(&meet_scopes_ll)?;
+            let level_scan_ll = LevelStream::new(
+                version,
+                level + 1,
+                start_ll,
+                end_ll,
+                (Bound::Included(lower), Bound::Included(upper)),
+                u32::MAX.into(),
+                None,
+                ProjectionMask::all(),
+                level_l_fs.clone(),
+                ctx.parquet_lru.clone(),
+            )
+            .ok_or(CompactionError::EmptyLevel)?;
+
+            streams.push(ScanStream::Level {
+                inner: level_scan_ll,
+            });
+        }
+
+        // Build the new SSTs
+        <LeveledCompactor<R> as Compactor<R>>::build_tables(
+            option,
+            version_edits,
+            level + 1,
+            streams,
+            instance,
+            level_l_fs,
+        )
+        .await?;
+
+        // Delete old files on both levels
+        for scope in meet_scopes_l {
+            version_edits.push(VersionEdit::Remove {
+                level: level as u8,
+                gen: scope.gen,
+            });
+            delete_gens.push(SsTableID::new(scope.gen, level));
+        }
+        for scope in meet_scopes_ll {
+            version_edits.push(VersionEdit::Remove {
+                level: (level + 1) as u8,
+                gen: scope.gen,
+            });
+            delete_gens.push(SsTableID::new(scope.gen, level + 1));
         }
 
         Ok(())
     }
-
     // Finds all SST files in the next level that overlap the range of the current level
     fn next_level_scopes<'a>(
         version: &'a Version<R>,
@@ -457,7 +548,6 @@ where
                 * option.level_sst_magnification.pow(level as u32))
     }
 }
-
 #[cfg(all(test, feature = "tokio"))]
 pub(crate) mod tests {
     use std::sync::{atomic::AtomicU32, Arc};
@@ -758,6 +848,7 @@ pub(crate) mod tests {
             &mut vec![],
             &TestSchema,
             &ctx,
+            0,
         )
         .await
         .unwrap();
@@ -908,6 +999,7 @@ pub(crate) mod tests {
             &mut vec![],
             &TestSchema,
             &ctx,
+            0,
         )
         .await
         .unwrap();
@@ -917,7 +1009,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_flush_major_level_sort() {
         let temp_dir = TempDir::new().unwrap();
-
+        eprintln!("test");
         let mut option = DbOption::new(
             Path::from_filesystem_path(temp_dir.path()).unwrap(),
             &TestSchema,
@@ -953,7 +1045,6 @@ pub(crate) mod tests {
             };
             db.insert(item).await.unwrap();
         }
-
         db.flush().await.unwrap();
 
         db.insert(Test {

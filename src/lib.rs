@@ -277,14 +277,14 @@ where
             record_schema.arrow_schema().clone(),
         ));
 
-        let mut compactor = match option.compaction_option {
-            CompactionOption::Leveled => Compactor::Leveled(LeveledCompactor::<R>::new(
+        let compactor = match option.compaction_option {
+            CompactionOption::Leveled => LeveledCompactor::<R>::new(
                 schema.clone(),
                 record_schema,
                 option.clone(),
                 ctx.clone(),
-            )),
-        };
+            ),
+        }; 
 
         executor.spawn(async move {
             if let Err(err) = cleaner.listen().await {
@@ -1037,21 +1037,11 @@ pub(crate) mod tests {
     use tracing::error;
 
     use crate::{
-        cast_arc_value,
-        compaction::{error::CompactionError, leveled::LeveledCompactor, CompactTask, Compactor},
-        context::Context,
-        executor::{tokio::TokioExecutor, Executor},
-        fs::{generate_file_id, manager::StoreManager},
-        inmem::{immutable::tests::TestSchema, mutable::MutableMemTable},
-        record::{
+        cast_arc_value, compaction::{error::CompactionError, leveled::LeveledCompactor, CompactTask, Compactor}, context::Context, executor::{tokio::TokioExecutor, Executor}, fs::{generate_file_id, manager::StoreManager}, inmem::{immutable::tests::TestSchema, mutable::MutableMemTable}, record::{
             option::OptionRecordRef,
             runtime::test::{test_dyn_item_schema, test_dyn_items},
             DataType, DynRecord, Key, RecordRef, Schema as RecordSchema, Value, F32, F64,
-        },
-        trigger::{TriggerFactory, TriggerType},
-        version::{cleaner::Cleaner, set::tests::build_version_set, Version},
-        wal::log::LogType,
-        CompactionOption, DbError, DbOption, Projection, Record, DB,
+        }, trigger::{TriggerFactory, TriggerType}, version::{cleaner::Cleaner, set::tests::build_version_set, Version}, wal::log::LogType, CompactionOption, DbError, DbOption, Projection, Record, DB
     };
 
     #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1396,13 +1386,13 @@ pub(crate) mod tests {
             version_set,
             TestSchema.arrow_schema().clone(),
         ));
-        let mut compactor = match option.compaction_option {
-            CompactionOption::Leveled => Compactor::Leveled(LeveledCompactor::<R>::new(
+        let compactor = match option.compaction_option {
+            CompactionOption::Leveled => LeveledCompactor::<R>::new(
                 schema.clone(),
                 record_schema,
                 option.clone(),
                 ctx.clone(),
-            )),
+            ),
         };
 
         executor.spawn(async move {

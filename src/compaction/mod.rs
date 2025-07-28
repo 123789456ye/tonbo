@@ -5,7 +5,6 @@ use std::{pin::Pin, sync::Arc};
 use fusio::DynFs;
 use fusio_parquet::writer::AsyncWriter;
 use futures_util::StreamExt;
-use leveled::LeveledCompactor;
 use parquet::arrow::AsyncArrowWriter;
 use tokio::sync::oneshot;
 
@@ -13,38 +12,39 @@ use crate::{
     compaction::error::CompactionError,
     fs::{generate_file_id, FileType},
     inmem::immutable::{ArrowArrays, Builder},
-    record::{KeyRef, Record, Schema as RecordSchema},
+    record::{self, KeyRef, Record, Schema as RecordSchema},
     scope::Scope,
     stream::{merge::MergeStream, ScanStream},
     version::edit::VersionEdit,
     DbOption,
 };
 
-pub(crate) enum Compactor<R>
+pub trait Compactor<R>
 where
     R: Record,
+    Self: Send + Sync,
+    <<R as record::Record>::Schema as record::Schema>::Columns: Send + Sync,
 {
-    Leveled(LeveledCompactor<R>),
-}
+    /// The concrete task type for this compactor.
+    type Task: Send + Sync;
 
-#[derive(Debug)]
-pub enum CompactTask {
-    Freeze,
-    Flush(Option<oneshot::Sender<()>>),
-}
-
-impl<R> Compactor<R>
-where
-    R: Record,
-{
-    pub(crate) async fn check_then_compaction(
-        &mut self,
+    /// Orchestrate flush + major compaction.
+    async fn check_then_compaction(
+        &self,
         is_manual: bool,
-    ) -> Result<(), CompactionError<R>> {
-        match self {
-            Compactor::Leveled(leveled) => leveled.check_then_compaction(is_manual).await,
-        }
-    }
+    ) -> Result<(), CompactionError<R>>;
+
+    /// Whether a major compaction is needed.
+    async fn should_major_compact(&self) -> bool;
+
+    /// Plan the next major compaction task.
+    async fn plan_major(&self) -> Option<Self::Task>;
+
+    /// Execute the given major compaction task.
+    async fn execute_major(&self, task: Self::Task) -> Result<(), CompactionError<R>>;
+
+    /// Flush the memtable to disk.
+    async fn minor_flush(&self, is_manual: bool) -> Result<Option<Self::Task>, CompactionError<R>>;
 
     async fn build_tables<'scan>(
         option: &DbOption,
@@ -159,6 +159,12 @@ where
         });
         Ok(())
     }
+}
+
+#[derive(Debug)]
+pub enum CompactTask {
+    Freeze,
+    Flush(Option<oneshot::Sender<()>>),
 }
 
 #[cfg(all(test, feature = "tokio"))]
