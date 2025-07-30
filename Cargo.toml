@@ -17,7 +17,7 @@ msrv = "1.79.0"
 aws = ["fusio-dispatch/aws", "fusio-log/aws", "fusio/aws"]
 bench = ["redb", "rocksdb", "sled"]
 bytes = ["dep:bytes"]
-datafusion = ["dep:async-trait", "dep:datafusion"]
+datafusion = ["dep:datafusion"]
 default = ["aws", "bytes", "tokio", "tokio-http"]
 load_tbl = []
 object-store = ["fusio/object_store"]
@@ -78,7 +78,7 @@ required-features = ["sled"]
 arrow = "55"
 async-lock = "3"
 async-stream = "0.3"
-async-trait = { version = "0.1", optional = true }
+async-trait = "0.1"
 bytes = { version = "1.7", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["wasmbind"] }
 crc32fast = "1"
