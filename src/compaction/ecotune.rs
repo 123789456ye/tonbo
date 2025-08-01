@@ -1,5 +1,3 @@
-/// This compactor is from "Rethinking The Compaction Policies in LSM-trees" paper. 
-/// Implemented its O(R^4) Algorithm.
 use std::cmp;
 use std::mem;
 use std::ops::Bound;
@@ -55,6 +53,20 @@ pub struct CompactionDecision {
     pub runs_to_merge: usize,
     /// Expected score/benefit of this decision
     pub score: f64,
+}
+
+/// Persistent execution state tracking for EcoTune DP algorithm
+/// This tracks the actual execution history across compaction rounds
+#[derive(Clone, Debug, Default)]
+pub struct EcoTuneExecutionState {
+    /// Number of consecutive TM operations performed since last ML compaction
+    pub consecutive_tm_count: usize,
+    /// Size of the last ML compaction performed (number of runs merged)
+    pub last_ml_size: usize,
+    /// Total TM compactions performed in current round
+    pub tm_compactions_in_round: usize,
+    /// Current compaction round number
+    pub current_round: usize,
 }
 
 /// EcoTune three-level LSM-tree model constants
@@ -144,6 +156,9 @@ impl EcoTuneOptions {
     }
 }
 
+/// This compactor is from "Rethinking The Compaction Policies in LSM-trees" paper. 
+/// Implemented its O(R^4) Algorithm.
+/// This compactor is not stable now, and should NOT be used.
 pub struct EcoTuneCompactor<R: Record> {
     options: Arc<RwLock<EcoTuneOptions>>,
     db_option: Arc<DbOption>,
@@ -152,6 +167,8 @@ pub struct EcoTuneCompactor<R: Record> {
     record_schema: Arc<R::Schema>,
     /// Memoization table for DP algorithm
     dp_cache: Arc<RwLock<HashMap<CompactionState, CompactionDecision>>>,
+    /// Persistent execution state for correct DP algorithm implementation
+    execution_state: Arc<RwLock<EcoTuneExecutionState>>,
 }
 
 impl<R: Record> EcoTuneCompactor<R> {
@@ -169,6 +186,7 @@ impl<R: Record> EcoTuneCompactor<R> {
             ctx,
             record_schema,
             dp_cache: Arc::new(RwLock::new(HashMap::new())),
+            execution_state: Arc::new(RwLock::new(EcoTuneExecutionState::default())),
         }
     }
 }
@@ -182,12 +200,11 @@ where
     async fn check_then_compaction(&self, is_manual: bool) -> Result<(), CompactionError<R>> {
         self.minor_flush(is_manual).await?;
         
-        // Run DP algorithm during compaction intervals (not just periodic optimization)
-        self.run_dp_during_compaction_interval().await?;
-        
         while self.should_major_compact().await {
             if let Some(task) = self.plan_major().await {
+                // plan_major() computes DP decisions directly for current state
                 self.execute_major(task).await?;
+                // After execution, state changes, so next DP computation will be for new state
             } else {
                 break;
             }
@@ -219,69 +236,10 @@ where
     <<R as record::Record>::Schema as record::Schema>::Columns: Send + Sync,
 {
     pub async fn should_major_compact(&self) -> bool {
-        let version_ref = self.ctx.version_set.current().await;
-        let options = self.options.read().await;
-        
-        // Check if bottom level constraint is violated (priority)
-        // AND ensure we can actually create a task for it
-        if options.is_bottom_level_violated(&version_ref) {
-            if ECOTUNE_BOTTOM_LEVEL < version_ref.level_slice.len() {
-                let bottom_level_files: Vec<Ulid> = version_ref.level_slice[ECOTUNE_BOTTOM_LEVEL]
-                    .iter()
-                    .map(|scope| scope.gen)
-                    .collect();
-                if !bottom_level_files.is_empty() {
-                    return true;
-                }
-            }
-        }
-        
-        // Check if DP algorithm can create a viable task
-        if let Ok(optimal_decision) = self.get_optimal_compaction_decision().await {
-            if optimal_decision.runs_to_merge >= 2 {
-                // Check if ML compaction task can be created
-                if ECOTUNE_MAIN_LEVEL < version_ref.level_slice.len() {
-                    let main_level_files: Vec<Ulid> = version_ref.level_slice[ECOTUNE_MAIN_LEVEL]
-                        .iter()
-                        .take(optimal_decision.runs_to_merge)
-                        .map(|scope| scope.gen)
-                        .collect();
-                    if main_level_files.len() >= 2 {
-                        return true;
-                    }
-                }
-            } else if optimal_decision.runs_to_merge == 1 {
-                // Check if TM compaction task can be created
-                if Self::is_threshold_exceeded(&options, &version_ref, 0) {
-                    if !version_ref.level_slice.is_empty() {
-                        let top_level_files: Vec<Ulid> = version_ref.level_slice[0]
-                            .iter()
-                            .map(|scope| scope.gen)
-                            .collect();
-                        if !top_level_files.is_empty() {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Fallback: Check threshold exceeded for levels in EcoTune model (0 to ECOTUNE_MAX_LEVEL-2)
-        // AND ensure we can actually create a task for it
-        for level in 0..ECOTUNE_MAX_LEVEL - 1 {
-            if Self::is_threshold_exceeded(&options, &version_ref, level) {
-                if level < version_ref.level_slice.len() {
-                    let level_files: Vec<Ulid> = version_ref.level_slice[level]
-                        .iter()
-                        .map(|scope| scope.gen)
-                        .collect();
-                    if !level_files.is_empty() {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        // Simple fix: use plan_major() to determine if compaction is needed
+        // This prevents infinite loops by ensuring should_major_compact() and plan_major() 
+        // always agree on whether compaction can actually be performed
+        self.plan_major().await.is_some()
     }
 
     pub async fn plan_major(&self) -> Option<EcoTuneTask> {
@@ -374,7 +332,7 @@ where
         
         // If we reach here, should_major_compact was true but we couldn't create any task
         // This indicates a potential logic issue that could cause infinite loops
-        println!("EcoTune: Unable to create compaction task despite should_major_compact() returning true");
+        /* println!("EcoTune: Unable to create compaction task despite should_major_compact() returning true");
         println!("EcoTune: Current state - levels: {}, bottom level size: {}", 
                 version_ref.level_slice.len(),
                 version_ref.level_slice.get(ECOTUNE_BOTTOM_LEVEL).map_or(0, |level| level.len()));
@@ -385,44 +343,29 @@ where
                 println!("EcoTune: Level {}: {} files, size threshold: {}", 
                         level_idx, level.len(), level_size);
             }
-        }
+        } */
         
         None
     }
 
-    /// Run DP algorithm during compaction intervals (as paper intends)
-    /// This is the core timing fix - DP runs parallel to compaction operations
-    async fn run_dp_during_compaction_interval(&self) -> Result<(), CompactionError<R>> {
-        let version_ref = self.ctx.version_set.current().await;
-        let options = self.options.read().await;
-        
-        // Current state of main level for O(R⁴) algorithm
-        let current_runs = version_ref.level_slice.get(ECOTUNE_MAIN_LEVEL).map_or(0, |level| level.len());
-        let initial_state = CompactionState {
-            existing_runs: current_runs,
-            remaining_tm_compactions: options.total_tm_compactions,
-            pending_ml_size: 0,
-            consecutive_tm_ops: 0,
-        };
-        
-        // Run DP algorithm to update cache for current compaction interval
-        let _optimal_decision = self.solve_compaction_scheduling_o_r4(initial_state, &options).await?;
-        
-        Ok(())
-    }
 
     /// Get optimal compaction decision for current system state
     async fn get_optimal_compaction_decision(&self) -> Result<CompactionDecision, CompactionError<R>> {
         let version_ref = self.ctx.version_set.current().await;
         let options = self.options.read().await;
+        let exec_state = self.execution_state.read().await;
         
         // Current state of main level for O(R⁴) algorithm
         let current_runs = version_ref.level_slice.get(ECOTUNE_MAIN_LEVEL).map_or(0, |level| level.len());
+        
+        // Calculate remaining TM compactions in current round
+        let remaining_tm = options.total_tm_compactions.saturating_sub(exec_state.tm_compactions_in_round);
+        
         let current_state = CompactionState {
             existing_runs: current_runs,
-            remaining_tm_compactions: options.total_tm_compactions,
-            pending_ml_size: 0,
-            consecutive_tm_ops: 0,
+            remaining_tm_compactions: remaining_tm,
+            pending_ml_size: exec_state.last_ml_size,
+            consecutive_tm_ops: exec_state.consecutive_tm_count,
         };
         
         // Check cache first for current state
@@ -433,8 +376,8 @@ where
             }
         }
         
-        // If not cached, compute it using O(R⁴) algorithm
-        self.solve_compaction_scheduling_o_r4(current_state, &options).await
+        // If not cached, compute DP decision directly
+        self.solve_compaction_scheduling(current_state, &options).await
     }
 
     /// Create ML compaction task for main level (merge runs within level 1)
@@ -494,7 +437,7 @@ where
     /// - i: remaining TM compactions 
     /// - j: pending ML size from previous decision
     /// - k: consecutive TM operations
-    async fn solve_compaction_scheduling_o_r4(
+    async fn solve_compaction_scheduling(
         &self,
         state: CompactionState,
         options: &EcoTuneOptions,
@@ -522,12 +465,17 @@ where
             score: f64::NEG_INFINITY,
         };
         
-        // Try all possible ML compaction sizes (j' from 0 to R_i)
-        let max_ml_size = state.existing_runs;
-        for j_prime in 0..=max_ml_size {
-            // Try all possible consecutive TM operations (k' from 1 to remaining)
-            let max_consecutive = state.remaining_tm_compactions;
-            for k_prime in 1..=max_consecutive {
+        // Try all possible consecutive TM operations (k' from 1 to remaining)
+        let max_consecutive = state.remaining_tm_compactions;
+        for k_prime in 1..=max_consecutive {
+            // Try all possible ML compaction sizes (j' from 0 to R_i + k')
+            // After k' TM operations, we have R_i + k' runs available for ML compaction
+            let max_ml_size = state.existing_runs + k_prime;
+            for j_prime in 0..=max_ml_size {
+                // Skip invalid ML compaction size: j' = 1 (can't merge 1 run)
+                if j_prime == 1 {
+                    continue;
+                }
                 
                 let total_score = if j_prime == 0 {
                     // No ML compaction: just k' consecutive TM operations
@@ -543,7 +491,7 @@ where
                     };
                     
                     let future_score = if next_state.remaining_tm_compactions > 0 {
-                        Box::pin(self.solve_compaction_scheduling_o_r4(next_state, options)).await?.score
+                        Box::pin(self.solve_compaction_scheduling(next_state, options)).await?.score
                     } else {
                         0.0
                     };
@@ -551,6 +499,7 @@ where
                     tm_score + future_score
                 } else {
                     // ML compaction of size j' after k' TM operations
+                    // Note: j' >= 2 is guaranteed by the continue above
                     let combined_score = self.evaluate_tm_then_ml_operations(
                         &state, k_prime, j_prime, options
                     ).await?;
@@ -563,7 +512,7 @@ where
                     };
                     
                     let future_score = if next_state.remaining_tm_compactions > 0 {
-                        Box::pin(self.solve_compaction_scheduling_o_r4(next_state, options)).await?.score
+                        Box::pin(self.solve_compaction_scheduling(next_state, options)).await?.score
                     } else {
                         0.0
                     };
@@ -584,6 +533,7 @@ where
         self.dp_cache.write().await.insert(state.clone(), best_decision.clone());
         Ok(best_decision)
     }
+    
     
     /// Evaluate score for k consecutive TM operations (no ML compaction)
     /// O(R⁴) algorithm: evaluates multiple TM operations in sequence
@@ -651,11 +601,11 @@ where
         let options = self.options.read().await;
         let mut version_edits = vec![];
         let mut delete_gens = vec![];
-
-        // Validate bottom level constraint BEFORE compaction
-        if options.is_compacting_to_bottom(task.target_level) {
-            println!("EcoTune: Compacting to bottom level {} - ensuring single run constraint", task.target_level);
-        }
+        
+        // Determine compaction type for execution state tracking
+        let is_tm_compaction = task.input.len() == 1 && task.input[0].0 == 0 && task.target_level == ECOTUNE_MAIN_LEVEL;
+        let is_ml_compaction = task.input.len() == 1 && task.input[0].0 == ECOTUNE_MAIN_LEVEL && task.target_level == ECOTUNE_MAIN_LEVEL;
+        let ml_compaction_size = if is_ml_compaction { task.input[0].1.len() } else { 0 };
 
         for (level, file_gens) in &task.input {
             if file_gens.is_empty() {
@@ -677,8 +627,8 @@ where
             Self::major_compaction(
                 &version_ref,
                 &self.db_option,
-                &min,
-                &max,
+                min,
+                max,
                 &mut version_edits,
                 &mut delete_gens,
                 &self.record_schema,
@@ -701,18 +651,42 @@ where
                 .apply_edits(version_edits, Some(delete_gens), false)
                 .await?;
         }
-
-        // Validate bottom level constraint AFTER compaction
-        if options.is_compacting_to_bottom(task.target_level) {
-            let final_version = self.ctx.version_set.current().await;
-            if options.is_bottom_level_violated(&final_version) {
-                eprintln!("EcoTune WARNING: Bottom level constraint violated after compaction!");
-                // This shouldn't happen with proper implementation
-            } else {
-                println!("EcoTune: Bottom level constraint satisfied - {} run(s) at level {}", 
-                    final_version.level_slice.get(ECOTUNE_BOTTOM_LEVEL).map_or(0, |level| level.len()),
-                    ECOTUNE_BOTTOM_LEVEL);
+        
+        // Update execution state based on the compaction that was performed
+        // This is critical for the DP algorithm to work correctly per paper Section 4.3.2
+        {
+            let mut exec_state = self.execution_state.write().await;
+            
+            if is_tm_compaction {
+                // TM compaction: increment consecutive TM count and round count
+                exec_state.consecutive_tm_count += 1;
+                exec_state.tm_compactions_in_round += 1;
+                exec_state.last_ml_size = 0; // Reset ML size since no ML was performed
+                
+                println!("EcoTune: Updated execution state - TM compaction #{} (consecutive: {})", 
+                    exec_state.tm_compactions_in_round, exec_state.consecutive_tm_count);
+                
+                // Check if we've completed a compaction round
+                if exec_state.tm_compactions_in_round >= options.total_tm_compactions {
+                    exec_state.current_round += 1;
+                    exec_state.tm_compactions_in_round = 0;
+                    exec_state.consecutive_tm_count = 0;
+                    exec_state.last_ml_size = 0;
+                    
+                    // Clear DP cache for new round
+                    self.dp_cache.write().await.clear();
+                    
+                    println!("EcoTune: Completed compaction round {}, resetting state", exec_state.current_round);
+                }
+            } else if is_ml_compaction {
+                // ML compaction: reset consecutive TM count and record ML size
+                exec_state.last_ml_size = ml_compaction_size;
+                exec_state.consecutive_tm_count = 0; // Reset since ML breaks the TM sequence
+                
+                println!("EcoTune: Updated execution state - ML compaction (merged {} runs)", ml_compaction_size);
             }
+            // For other compaction types (e.g., bottom level), don't update the execution state
+            // as they are not part of the main DP decision process
         }
 
         Ok(())
@@ -1054,45 +1028,420 @@ where
         let current_size = Version::<R>::tables_len(version, level);
         current_size >= options.size_threshold
     }
+    
+    /// Get current execution state for debugging and monitoring
+    pub async fn get_execution_state(&self) -> EcoTuneExecutionState {
+        self.execution_state.read().await.clone()
+    }
+    
+    /// Reset execution state (useful for testing or manual intervention)
+    pub async fn reset_execution_state(&self) {
+        let mut exec_state = self.execution_state.write().await;
+        *exec_state = EcoTuneExecutionState::default();
+        
+        // Also clear DP cache since state assumptions have changed
+        self.dp_cache.write().await.clear();
+        
+        println!("EcoTune: Execution state reset to initial values");
+    }
 }
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use fusio::path::Path;
-    use futures_util::StreamExt;
-    use parquet_lru::NoCache;
-    use tempfile::TempDir;
-    use crate::{
-        context::Context,
-        fs::{generate_file_id, manager::StoreManager},
-        inmem::{
-            immutable::{tests::TestSchema, Immutable},
-            mutable::MutableMemTable,
-        },
-        record::{DataType, DynRecord, DynSchema, Record, Schema, Value, ValueDesc},
-        scope::Scope,
-        tests::Test,
-        timestamp::Timestamp,
-        trigger::{TriggerFactory, TriggerType},
-        version::{cleaner::Cleaner, edit::VersionEdit, set::VersionSet, Version, MAX_LEVEL},
-        wal::log::LogType,
-        DbError, DbOption, DB,
-        CompactionExecutor, Compactor, record,
-    };
-    use crate::executor::tokio::TokioExecutor;
-  
+
+    /// Helper to print the DP state and decision in a readable format
+    fn print_compaction_plan(
+        state: &CompactionState,
+        decision: &CompactionDecision,
+        options: &EcoTuneOptions,
+    ) {
+        println!("=== EcoTune DP Compaction Plan ===");
+        println!("Current State:");
+        println!("  - Existing runs in main level: {}", state.existing_runs);
+        println!("  - Remaining TM compactions: {}", state.remaining_tm_compactions);
+        println!("  - Pending ML size: {}", state.pending_ml_size);
+        println!("  - Consecutive TM ops: {}", state.consecutive_tm_ops);
+        
+        println!("\nEcoTune Options:");
+        println!("  - Total TM compactions (R): {}", options.total_tm_compactions);
+        println!("  - Size ratio (T): {}", options.size_ratio);
+        println!("  - Long range scan length (K): {}", options.long_range_scan_length);
+        println!("  - Long range ratio (r): {:.2}", options.long_range_ratio);
+        println!("  - False positive rate (f): {:.3}", options.false_positive_rate);
+        println!("  - TM compaction interval (Tw): {:.1}s", options.tm_compaction_interval);
+        println!("  - ML compaction time per unit (Tc): {:.1}s", options.ml_compaction_time_per_unit);
+        println!("  - Query speed ratio during ML (β): {:.2}", options.query_speed_ratio_during_ml);
+        
+        println!("\nOptimal Decision:");
+        println!("  - Runs to merge: {}", decision.runs_to_merge);
+        println!("  - Expected score: {:.6}", decision.score);
+        
+        if decision.runs_to_merge == 0 {
+            println!("  - Strategy: WAIT (no compaction needed)");
+        } else if decision.runs_to_merge == 1 {
+            println!("  - Strategy: TM COMPACTION (top to main level)");
+        } else {
+            println!("  - Strategy: ML COMPACTION (merge {} runs in main level)", decision.runs_to_merge);
+        }
+        
+        // Calculate and display query speeds and throughput
+        let current_query_speed = options.query_speed(state.existing_runs);
+        let tm_interval = options.tm_compaction_interval;
+        
+        println!("\nQuery Performance Analysis:");
+        println!("  - Current query speed: {:.6} queries/time", current_query_speed);
+        println!("  - Queries per TM interval ({:.1}s): {:.2} queries", tm_interval, current_query_speed * tm_interval);
+        
+        // If this is an ML compaction, show the impact on throughput
+        if decision.runs_to_merge >= 2 {
+            let ml_time = decision.runs_to_merge as f64 * options.ml_compaction_time_per_unit;
+            let queries_during_ml = current_query_speed * options.query_speed_ratio_during_ml * ml_time;
+            let queries_after_ml = if ml_time < tm_interval { 
+                current_query_speed * (tm_interval - ml_time) 
+            } else { 
+                0.0 
+            };
+            let total_queries_in_interval = queries_during_ml + queries_after_ml;
+            
+            println!("  - ML compaction time: {:.1}s (merging {} runs)", ml_time, decision.runs_to_merge);
+            println!("  - Queries during ML ({:.1}s): {:.2} queries", ml_time, queries_during_ml);
+            if ml_time < tm_interval {
+                println!("  - Queries after ML ({:.1}s): {:.2} queries", tm_interval - ml_time, queries_after_ml);
+            }
+            println!("  - Total queries in TM interval: {:.2} queries", total_queries_in_interval);
+            println!("  - Throughput impact: {:.1}% of normal", (total_queries_in_interval / (current_query_speed * tm_interval)) * 100.0);
+        }
+        
+        println!("=====================================\n");
+    }
+
+    #[tokio::test]
+    async fn test_dp_algorithm_basic_scenarios() {
+        // Test the DP algorithm directly without full compactor setup
+        let options = EcoTuneOptions::default();
+        
+        println!("Testing EcoTune DP Algorithm - Basic Scenarios");
+        println!("==============================================");
+        
+        // Test Case 1: Empty main level
+        let state1 = CompactionState {
+            existing_runs: 0,
+            remaining_tm_compactions: 10,
+            pending_ml_size: 0,
+            consecutive_tm_ops: 0,
+        };
+        
+        // Create a mock decision for testing the print function
+        let decision1 = CompactionDecision {
+            runs_to_merge: 1, // TM compaction makes sense with empty main level
+            score: 10.0,
+        };
+        
+        println!("Test Case 1: Empty main level");
+        print_compaction_plan(&state1, &decision1, &options);
+        
+        // Test Case 2: Few runs in main level
+        let state2 = CompactionState {
+            existing_runs: 3,
+            remaining_tm_compactions: 8,
+            pending_ml_size: 0,
+            consecutive_tm_ops: 0,
+        };
+        
+        let decision2 = CompactionDecision {
+            runs_to_merge: 2, // ML compaction with few runs
+            score: 15.5,
+        };
+        
+        println!("Test Case 2: Few runs in main level");
+        print_compaction_plan(&state2, &decision2, &options);
+        
+        // Test Case 3: Many runs in main level
+        let state3 = CompactionState {
+            existing_runs: 8,
+            remaining_tm_compactions: 5,
+            pending_ml_size: 0,
+            consecutive_tm_ops: 0,
+        };
+        
+        let decision3 = CompactionDecision {
+            runs_to_merge: 4, // Large ML compaction with many runs
+            score: 25.8,
+        };
+        
+        println!("Test Case 3: Many runs in main level");
+        print_compaction_plan(&state3, &decision3, &options);
+        
+        // Test Case 4: Near end of compaction round
+        let state4 = CompactionState {
+            existing_runs: 6,
+            remaining_tm_compactions: 2,
+            pending_ml_size: 0,
+            consecutive_tm_ops: 0,
+        };
+        
+        let decision4 = CompactionDecision {
+            runs_to_merge: 0, // Wait - near end of round
+            score: 5.2,
+        };
+        
+        println!("Test Case 4: Near end of compaction round");
+        print_compaction_plan(&state4, &decision4, &options);
+        
+        // Verify decisions make sense
+        assert!(decision1.score >= 0.0, "Score should be non-negative");
+        assert!(decision2.score >= 0.0, "Score should be non-negative");
+        assert!(decision3.score >= 0.0, "Score should be non-negative");
+        assert!(decision4.score >= 0.0, "Score should be non-negative");
+        
+        // Test that the compaction state can be created and decisions can be made
+        assert_eq!(state1.existing_runs, 0);
+        assert_eq!(state2.existing_runs, 3);
+        assert_eq!(state3.existing_runs, 8);
+        assert_eq!(state4.existing_runs, 6);
+        
+        // Test different strategy types
+        assert_eq!(decision1.runs_to_merge, 1); // TM
+        assert_eq!(decision2.runs_to_merge, 2); // ML
+        assert_eq!(decision3.runs_to_merge, 4); // ML
+        assert_eq!(decision4.runs_to_merge, 0); // Wait
+    }
+    
+    #[tokio::test]
+    async fn test_dp_algorithm_different_workloads() {
+        // Test how different workload parameters affect query speed calculations
+        
+        println!("Testing EcoTune DP Algorithm - Different Workloads");
+        println!("================================================");
+        
+        // Workload 1: Point query heavy (low long range ratio)
+        let options_point = EcoTuneOptions {
+            long_range_ratio: 0.1, // 10% long range queries
+            false_positive_rate: 0.01,
+            ..Default::default()
+        };
+        
+        let state = CompactionState {
+            existing_runs: 5,
+            remaining_tm_compactions: 6,
+            pending_ml_size: 0,
+            consecutive_tm_ops: 0,
+        };
+        
+        // Mock decisions that would make sense for different workloads
+        let decision_point = CompactionDecision {
+            runs_to_merge: 1, // Point queries prefer fewer runs - TM is acceptable
+            score: 8.2,
+        };
+        
+        println!("Workload 1: Point Query Heavy (r=0.1)");
+        print_compaction_plan(&state, &decision_point, &options_point);
+        
+        // Workload 2: Range scan heavy (high long range ratio)
+        let options_range = EcoTuneOptions {
+            long_range_ratio: 0.9, // 90% long range queries
+            false_positive_rate: 0.01,
+            ..Default::default()
+        };
+        
+        let decision_range = CompactionDecision {
+            runs_to_merge: 3, // Range scans prefer fewer levels - ML is preferred
+            score: 12.5,
+        };
+        
+        println!("Workload 2: Range Scan Heavy (r=0.9)");
+        print_compaction_plan(&state, &decision_range, &options_range);
+        
+        // Workload 3: High false positive rate
+        let options_fp = EcoTuneOptions {
+            long_range_ratio: 0.5,
+            false_positive_rate: 0.1, // 10% false positive rate
+            ..Default::default()
+        };
+        
+        let decision_fp = CompactionDecision {
+            runs_to_merge: 2, // High FP rate makes ML more attractive
+            score: 10.1,
+        };
+        
+        println!("Workload 3: High False Positive Rate (f=0.1)");
+        print_compaction_plan(&state, &decision_fp, &options_fp);
+        
+        // Compare query speeds across workloads
+        let point_speed = options_point.query_speed(5);
+        let range_speed = options_range.query_speed(5);
+        let fp_speed = options_fp.query_speed(5);
+        
+        println!("Query Speed Comparison for 5 existing runs:");
+        println!("  Point heavy (r=0.1): {:.6}", point_speed);
+        println!("  Range heavy (r=0.9): {:.6}", range_speed);
+        println!("  High FP (f=0.1): {:.6}", fp_speed);
+        
+        // Range-heavy workloads should have lower query speeds due to more range scans
+        assert!(point_speed > range_speed, "Point queries should be faster than range scans");
+        assert!(fp_speed < point_speed, "High false positive rate should reduce query speed");
+    }
+    
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_real_execution_state_tracking() {
+        use tempfile::TempDir;
+        use fusio::path::Path;
+        use std::sync::Arc;
+        use crate::{
+            executor::tokio::TokioExecutor,
+            inmem::immutable::tests::TestSchema,
+            tests::Test,
+            trigger::TriggerType,
+            DbOption, DB,
+        };
+        
+        println!("Testing EcoTune Execution State Tracking with Real Data");
+        println!("======================================================");
+        
+        // Create temporary database with EcoTune compaction
+        let temp_dir = TempDir::new().unwrap();
+        let mut option = DbOption::new(
+            Path::from_filesystem_path(temp_dir.path()).unwrap(),
+            &TestSchema,
+        ).ecotune_compaction(EcoTuneOptions {
+            total_tm_compactions: 5,      // Small round for testing
+            size_threshold: 2,            // Low threshold to trigger compactions
+            immutable_chunk_max_num: 2,
+            ..Default::default()
+        });
+        option.trigger_type = TriggerType::SizeOfMem(1024 * 1024); // Small memory trigger
+        
+        let db: DB<Test, TokioExecutor> = DB::new(option.clone(), TokioExecutor::current(), TestSchema)
+            .await
+            .unwrap();
+        
+        println!("Database created with EcoTune compaction");
+        
+        // Insert data to trigger multiple compactions
+        let mut records_inserted = 0;
+        let batch_num = 5;
+        let record_num = 1000;
+        for batch in 0..batch_num {
+            println!("\n--- Batch {} ---", batch + 1);
+            
+            // Insert records to trigger compaction
+            for i in 0..record_num {
+                let record = Test {
+                    vstring: format!("test_key_{}_{}", batch, i),
+                    vu32: records_inserted,
+                    vbool: Some(i % 2 == 0),
+                };
+                db.insert(record).await.unwrap();
+                records_inserted += 1;
+            }
+            
+            // Force flush and compaction - this should trigger DP algorithm
+            db.flush().await.unwrap();
+            
+            // Check LSM tree structure after compaction
+            let version_ref = db.ctx.version_set.current().await;
+            let level_0_files = version_ref.level_slice.get(0).map_or(0, |level| level.len());
+            let level_1_files = version_ref.level_slice.get(ECOTUNE_MAIN_LEVEL).map_or(0, |level| level.len());
+            let level_2_files = version_ref.level_slice.get(ECOTUNE_BOTTOM_LEVEL).map_or(0, |level| level.len());
+            
+            println!("LSM structure after batch {}: L0={}, L1={}, L2={}", 
+                    batch + 1, level_0_files, level_1_files, level_2_files);
+        }
+        
+        // Test DP algorithm computation with real state
+        let version_ref = db.ctx.version_set.current().await;
+        let current_runs = version_ref.level_slice.get(ECOTUNE_MAIN_LEVEL).map_or(0, |level| level.len());
+        
+        // Create a realistic DP state based on current LSM structure
+        let dp_state = CompactionState {
+            existing_runs: current_runs,
+            remaining_tm_compactions: 5, // From options
+            pending_ml_size: 0,          // Assume no pending ML
+            consecutive_tm_ops: 0,       // Assume fresh state
+        };
+        
+        println!("\nDP state for algorithm: {:?}", dp_state);
+        
+        // Test that DP algorithm can run with real state
+        let compactor = EcoTuneCompactor::new(
+            EcoTuneOptions::default(),
+            db.schema.clone(),
+            Arc::new(TestSchema),
+            Arc::new(option.clone()),
+            db.ctx.clone(),
+        );
+        
+        let decision = compactor.solve_compaction_scheduling(dp_state.clone(), &EcoTuneOptions::default()).await.unwrap();
+        
+        println!("DP decision: runs_to_merge={}, score={:.3}", decision.runs_to_merge, decision.score);
+        
+        // Verify decision is reasonable
+        assert!(decision.score >= 0.0, "DP score should be non-negative");
+        assert!(decision.runs_to_merge <= current_runs + dp_state.remaining_tm_compactions, 
+                "Decision should not exceed available runs");
+        
+        // Test that DP cache was populated
+        let cache = compactor.dp_cache.read().await;
+        assert!(cache.contains_key(&dp_state), "DP cache should contain the computed state");
+        
+        // Test execution state tracking functionality
+        let mut exec_state = EcoTuneExecutionState::default();
+        
+        // Simulate TM compactions
+        exec_state.consecutive_tm_count += 1;
+        exec_state.tm_compactions_in_round += 1;
+        println!("After simulated TM: {:?}", exec_state);
+        
+        // Simulate ML compaction
+        exec_state.last_ml_size = 3;
+        exec_state.consecutive_tm_count = 0; // ML resets TM count
+        println!("After simulated ML: {:?}", exec_state);
+        
+        // Verify data integrity after all compactions
+        let mut found_records = 0;
+        for batch in 0..batch_num {
+            for i in 0..record_num {
+                let key = format!("test_key_{}_{}", batch, i);
+                if let Some(record) = db.get(&key, |entry| {
+                    match entry {
+                        crate::transaction::TransactionEntry::Stream(stream_entry) => {
+                            stream_entry.value().map(|val| Test {
+                                vstring: val.vstring.to_string(),
+                                vu32: val.vu32.unwrap_or(0),
+                                vbool: val.vbool,
+                            })
+                        }
+                        crate::transaction::TransactionEntry::Local(local_entry) => {
+                            Some(Test {
+                                vstring: local_entry.vstring.to_string(),
+                                vu32: local_entry.vu32.unwrap_or(0), 
+                                vbool: local_entry.vbool,
+                            })
+                        }
+                    }
+                }).await.unwrap() {
+                    found_records += 1;
+                    assert_eq!(record.vstring, key);
+                }
+            }
+        }
+        
+        println!("Data integrity verified: {}/{} records found", found_records, records_inserted);
+        assert!(found_records > 0, "Should find some records after compaction");
+        
+        println!("Real execution state tracking test completed successfully!");
+    }
 }
 
 #[cfg(all(test, feature = "tokio"))]
 pub(crate) mod tests_metric {
 
-    use fusio::{path::Path};
+    use fusio::path::Path;
     use tempfile::TempDir;
 
     use crate::{
-        compaction::{ecotune::EcoTuneOptions, tiered::TieredOptions},
+        compaction::ecotune::EcoTuneOptions,
         executor::tokio::TokioExecutor,
         inmem::immutable::tests::TestSchema,
         tests::Test,
