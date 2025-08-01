@@ -165,7 +165,12 @@ pub use crate::magic::TS;
 pub use crate::timestamp::Ts;
 use crate::{
     compaction::{
-        error::CompactionError, leveled::LeveledCompactor, tiered::TieredCompactor, CompactTask,
+        error::CompactionError, 
+        leveled::LeveledCompactor, 
+        lazyleveled::LazyLeveledCompactor, 
+        tiered::TieredCompactor, 
+        ecotune::EcoTuneCompactor,
+        CompactTask,
         Compactor,
     },
     executor::Executor,
@@ -277,6 +282,28 @@ where
 
             CompactionOption::Tiered(opt) => {
                 let compactor = TieredCompactor::<R>::new(
+                    opt.clone(),
+                    schema.clone(),
+                    record_schema.clone(),
+                    option.clone(),
+                    ctx.clone(),
+                );
+                Self::finish_build(executor, schema, ctx, compactor, cleaner, task_rx).await
+            }
+
+            CompactionOption::LazyLeveled(opt) => {
+                let compactor = LazyLeveledCompactor::<R>::new(
+                    opt.clone(),
+                    schema.clone(),
+                    record_schema.clone(),
+                    option.clone(),
+                    ctx.clone(),
+                );
+                Self::finish_build(executor, schema, ctx, compactor, cleaner, task_rx).await
+            }
+
+            CompactionOption::EcoTune(opt) => {
+                let compactor = EcoTuneCompactor::<R>::new(
                     opt.clone(),
                     schema.clone(),
                     record_schema.clone(),
@@ -1130,7 +1157,11 @@ pub(crate) mod tests {
     use crate::{
         cast_arc_value,
         compaction::{
-            error::CompactionError, leveled::LeveledCompactor, tiered::TieredCompactor,
+            error::CompactionError, 
+            leveled::LeveledCompactor, 
+            lazyleveled::LazyLeveledCompactor, 
+            tiered::TieredCompactor,
+            ecotune::EcoTuneCompactor,
             CompactTask,
         },
         context::Context,
@@ -1506,6 +1537,28 @@ pub(crate) mod tests {
 
             CompactionOption::Tiered(opt) => {
                 let compactor = TieredCompactor::<R>::new(
+                    opt.clone(),
+                    schema.clone(),
+                    record_schema.clone(),
+                    option.clone(),
+                    ctx.clone(),
+                );
+                finish_db_with_compactor(executor, schema, ctx, compactor, cleaner, compaction_rx).await
+            }
+
+            CompactionOption::LazyLeveled(opt) => {
+                let compactor = LazyLeveledCompactor::<R>::new(
+                    opt.clone(),
+                    schema.clone(),
+                    record_schema.clone(),
+                    option.clone(),
+                    ctx.clone(),
+                );
+                finish_db_with_compactor(executor, schema, ctx, compactor, cleaner, compaction_rx).await
+            }
+
+            CompactionOption::EcoTune(opt) => {
+                let compactor = EcoTuneCompactor::<R>::new(
                     opt.clone(),
                     schema.clone(),
                     record_schema.clone(),
