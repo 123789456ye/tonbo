@@ -119,7 +119,7 @@ pub mod option;
 pub mod record;
 mod scope;
 pub(crate) mod snapshot;
-pub(crate) mod stream;
+pub mod stream;
 pub mod transaction;
 mod trigger;
 mod version;
