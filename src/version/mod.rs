@@ -307,9 +307,19 @@ where
                 continue;
             }
 
+            // Create prefetch buffer if enabled
+            let prefetch_buffer = if self.option.use_prefetch {
+                Some(Arc::new(crate::stream::prefetch::PrefetchBufferCollection::new(
+                    level_fs.clone(),
+                    8, // Buffer up to 8 concurrent files
+                )))
+            } else {
+                None
+            };
+
             streams.push(ScanStream::Level {
                 // SAFETY: checked scopes no empty
-                inner: LevelStream::new(
+                inner: LevelStream::new_with_prefetch(
                     self,
                     i + 1,
                     start.unwrap(),
@@ -322,6 +332,7 @@ where
                     ctx.parquet_lru.clone(),
                     order,
                     pk_indices,
+                    prefetch_buffer,
                 )
                 .unwrap(),
             });

@@ -23,6 +23,8 @@ pub struct DbOption {
     use_wal: bool,
     /// Maximum size of WAL buffer size
     wal_buffer_size: usize,
+    /// Enable prefetch buffer for sequential access optimization
+    use_prefetch: bool,
     /// build the `DB` storage directory based on the passed path
     path: String,
     base_fs: FsOptions,
@@ -46,6 +48,7 @@ impl DbOption {
             version_log_snapshot_threshold: 200,
             use_wal: true,
             wal_buffer_size: 4 * 1024,
+            use_prefetch: true,
             path,
             base_fs: FsOptions::local(),
             level_paths: vec![None; MAX_LEVEL],
@@ -61,6 +64,16 @@ impl DbOption {
         self.level_paths[level] = Some((path.to_string(), fs_options));
         Ok(self)
     }
+
+    #[wasm_bindgen(getter)]
+    pub fn use_prefetch(&self) -> bool {
+        self.use_prefetch
+    }
+
+    #[wasm_bindgen(setter)]
+    pub fn set_use_prefetch(&mut self, use_prefetch: bool) {
+        self.use_prefetch = use_prefetch;
+    }
 }
 
 impl DbOption {
@@ -74,7 +87,8 @@ impl DbOption {
             .max_sst_file_size(self.max_sst_file_size)
             .version_log_snapshot_threshold(self.version_log_snapshot_threshold)
             .wal_buffer_size(self.wal_buffer_size)
-            .base_fs(self.base_fs.into_fs_options());
+            .base_fs(self.base_fs.into_fs_options())
+            .use_prefetch(self.use_prefetch);
 
         for (level, path) in self.level_paths.into_iter().enumerate() {
             if let Some((path, fs_options)) = path {
@@ -87,6 +101,7 @@ impl DbOption {
         if !self.use_wal {
             opt = opt.disable_wal()
         }
+        
         opt
     }
 }

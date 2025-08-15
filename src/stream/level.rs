@@ -22,7 +22,7 @@ use crate::{
     option::Order,
     record::{Record, Schema},
     scope::Scope,
-    stream::record_batch::RecordBatchEntry,
+    stream::{prefetch::PrefetchBufferCollection, record_batch::RecordBatchEntry},
     version::{timestamp::Timestamp, Version},
     DbOption,
 };
@@ -37,7 +37,7 @@ where
         Ulid,
         Pin<Box<dyn MaybeSendFuture<Output = Result<Box<dyn DynFile>, Error>> + 'level>>,
     ),
-    OpenSst(Pin<Box<dyn MaybeSendFuture<Output = Result<SsTable<R>, Error>> + 'level>>),
+    OpenSst(Ulid, Pin<Box<dyn MaybeSendFuture<Output = Result<SsTable<R>, Error>> + 'level>>),
     LoadStream(
         Pin<Box<dyn Future<Output = Result<SsTableScan<'level, R>, ParquetError>> + Send + 'level>>,
     ),
@@ -61,6 +61,7 @@ where
     parquet_lru: Arc<dyn DynLruCache<Ulid> + Send + Sync>,
     order: Option<Order>,
     pk_indices: &'level [usize],
+    prefetch_buffer: Option<Arc<PrefetchBufferCollection>>,
 }
 
 impl<'level, R> LevelStream<'level, R>
@@ -86,6 +87,31 @@ where
         order: Option<Order>,
         pk_indices: &'level [usize],
     ) -> Option<Self> {
+        Self::new_with_prefetch(
+            version, level, start, end, range, ts, limit, projection_mask,
+            fs, parquet_lru, order, pk_indices, None
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_prefetch(
+        version: &Version<R>,
+        level: usize,
+        start: usize,
+        end: usize,
+        range: (
+            Bound<&'level <R::Schema as Schema>::Key>,
+            Bound<&'level <R::Schema as Schema>::Key>,
+        ),
+        ts: Timestamp,
+        limit: Option<usize>,
+        projection_mask: ProjectionMask,
+        fs: Arc<dyn DynFs>,
+        parquet_lru: Arc<dyn DynLruCache<Ulid> + Send + Sync>,
+        order: Option<Order>,
+        pk_indices: &'level [usize],
+        prefetch_buffer: Option<Arc<PrefetchBufferCollection>>,
+    ) -> Option<Self> {
         let (lower, upper) = range;
         let mut gens: VecDeque<FileId> = version.level_slice[level][start..end + 1]
             .iter()
@@ -98,6 +124,17 @@ where
         }
 
         let first_gen = gens.pop_front()?;
+
+        // Start prefetching next files if we have a prefetch buffer
+        if let Some(ref prefetch) = prefetch_buffer {
+            let option = version.option();
+            // Use page-level prefetching for projected columns
+            for gen in gens.iter().take(2) {
+                let path = option.table_path(*gen, level);
+                prefetch.prefetch_batches(*gen, path, projection_mask.clone());
+            }
+        }
+
         let status = FutureStatus::Init(first_gen);
 
         Some(LevelStream {
@@ -115,6 +152,7 @@ where
             parquet_lru,
             order,
             pk_indices,
+            prefetch_buffer,
         })
     }
 }
@@ -126,12 +164,37 @@ where
     type Item = Result<RecordBatchEntry<R>, ParquetError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Poll prefetch operations to advance their state and perform maintenance
+        if let Some(ref prefetch) = self.prefetch_buffer {
+            prefetch.poll_prefetches(cx);
+            
+            // Periodically perform maintenance (every ~10 polls to avoid overhead)
+            static mut POLL_COUNTER: usize = 0;
+            unsafe {
+                POLL_COUNTER += 1;
+                if POLL_COUNTER % 10 == 0 {
+                    prefetch.maintain();
+                }
+            }
+        }
+
         loop {
+            // Extract values that might be needed to avoid borrow conflicts
+            let lower = self.lower;
+            let upper = self.upper;
+            let ts = self.ts;
+            let limit = self.limit;
+            let projection_mask = self.projection_mask.clone();
+            let order = self.order;
+            let pk_indices = self.pk_indices;
+            let prefetch_buffer = self.prefetch_buffer.clone();
+            
             return match &mut self.status {
                 FutureStatus::Init(gen) => {
                     let gen = *gen;
                     self.path = Some(self.option.table_path(gen, self.level));
 
+                    // Direct file opening (prefetch only helps with page-level access later)
                     let reader = self.fs.open_options(
                         self.path.as_ref().unwrap(),
                         FileType::Parquet.open_options(true),
@@ -157,6 +220,16 @@ where
                         Some(gen) => {
                             self.path = Some(self.option.table_path(gen, self.level));
 
+                            // Start prefetching the next file if we have a prefetch buffer and more files
+                            if let Some(ref prefetch) = self.prefetch_buffer {
+                                if let Some(next_gen) = self.gens.front() {
+                                    let next_path = self.option.table_path(*next_gen, self.level);
+                                    // Use page-level prefetching
+                                    prefetch.prefetch_batches(*next_gen, next_path, self.projection_mask.clone());
+                                }
+                            }
+
+                            // Direct file opening (prefetch benefits come at page level)
                             let reader = self.fs.open_options(
                                 self.path.as_ref().unwrap(),
                                 FileType::Parquet.open_options(true),
@@ -180,7 +253,9 @@ where
                     },
                     Poll::Ready(Some(result)) => {
                         if let Some(limit) = &mut self.limit {
-                            *limit -= 1;
+                            if *limit > 0 {
+                                *limit -= 1;
+                            }
                         }
                         Poll::Ready(Some(result))
                     }
@@ -189,7 +264,7 @@ where
                 FutureStatus::OpenFile(id, file_future) => match Pin::new(file_future).poll(cx) {
                     Poll::Ready(Ok(file)) => {
                         let id = *id;
-                        self.status = FutureStatus::OpenSst(Box::pin(SsTable::open(
+                        self.status = FutureStatus::OpenSst(id, Box::pin(SsTable::open(
                             self.parquet_lru.clone(),
                             id,
                             file,
@@ -201,16 +276,20 @@ where
                     }
                     Poll::Pending => Poll::Pending,
                 },
-                FutureStatus::OpenSst(sst_future) => match Pin::new(sst_future).poll(cx) {
+                FutureStatus::OpenSst(file_id, sst_future) => match Pin::new(sst_future).poll(cx) {
                     Poll::Ready(Ok(sst)) => {
-                        self.status = FutureStatus::LoadStream(Box::pin(sst.scan(
-                            (self.lower, self.upper),
-                            self.ts,
-                            self.limit,
-                            self.projection_mask.clone(),
-                            self.order,
-                            self.pk_indices,
-                        )));
+                        // Use scan_with_prefetch (which handles None values for regular scan)
+                        let scan_future = sst.scan_with_prefetch(
+                            (lower, upper),
+                            ts,
+                            limit,
+                            projection_mask,
+                            order,
+                            pk_indices,
+                            Some(*file_id),
+                            prefetch_buffer,
+                        );
+                        self.status = FutureStatus::LoadStream(Box::pin(scan_future));
                         continue;
                     }
                     Poll::Ready(Err(err)) => {

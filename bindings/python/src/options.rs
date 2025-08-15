@@ -33,6 +33,9 @@ pub struct DbOption {
     /// Maximum size of WAL buffer size
     #[pyo3(get, set)]
     wal_buffer_size: usize,
+    /// Enable prefetch buffer for sequential access optimization
+    #[pyo3(get, set)]
+    use_prefetch: bool,
     /// build the `DB` storage directory based on the passed path
     #[pyo3(get, set)]
     path: String,
@@ -55,6 +58,7 @@ impl DbOption {
             version_log_snapshot_threshold: 200,
             use_wal: true,
             wal_buffer_size: 4 * 1024,
+            use_prefetch: true,
             path,
             base_fs: FsOptions::Local {},
             level_paths: vec![None; MAX_LEVEL],
@@ -95,6 +99,7 @@ impl DbOption {
         if !self.use_wal {
             opt = opt.disable_wal()
         }
+        opt = opt.use_prefetch(self.use_prefetch);
         opt
     }
 }

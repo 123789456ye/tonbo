@@ -2,6 +2,7 @@ pub(crate) mod level;
 pub(crate) mod mem_projection;
 pub(crate) mod merge;
 pub(crate) mod package;
+pub(crate) mod prefetch;
 pub(crate) mod record_batch;
 
 use std::{

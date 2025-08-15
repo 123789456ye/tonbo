@@ -124,6 +124,24 @@ where
         order: Option<Order>,
         pk_indices: &[usize],
     ) -> Result<SsTableScan<'scan, R>, parquet::errors::ParquetError> {
+        self.scan_with_prefetch(range, ts, limit, projection_mask, order, pk_indices, None, None).await
+    }
+    
+    /// Scan with optional prefetch support
+    pub(crate) async fn scan_with_prefetch<'scan>(
+        self,
+        range: (
+            Bound<&'scan <R::Schema as Schema>::Key>,
+            Bound<&'scan <R::Schema as Schema>::Key>,
+        ),
+        ts: Timestamp,
+        limit: Option<usize>,
+        projection_mask: ProjectionMask,
+        order: Option<Order>,
+        pk_indices: &[usize],
+        file_id: Option<FileId>,
+        prefetch_buffer: Option<std::sync::Arc<crate::stream::prefetch::PrefetchBufferCollection>>,
+    ) -> Result<SsTableScan<'scan, R>, parquet::errors::ParquetError> {
         let builder = self
             .into_parquet_builder(limit, projection_mask.clone())
             .await?;
@@ -134,12 +152,26 @@ where
         // Build a row filter for ts and primary key range
         let filter = get_range_filter::<R>(schema_descriptor, range, ts, pk_indices);
 
-        Ok(SsTableScan::new(
-            builder.with_row_filter(filter).build()?,
-            projection_mask,
-            full_schema,
-            order,
-        ))
+        let stream = builder.with_row_filter(filter).build()?;
+        
+        // Use prefetch-enabled constructor if prefetch support is provided
+        if let (Some(file_id), Some(prefetch_buffer)) = (file_id, prefetch_buffer) {
+            Ok(SsTableScan::new_with_prefetch(
+                stream,
+                projection_mask,
+                full_schema,
+                order,
+                file_id,
+                prefetch_buffer,
+            ))
+        } else {
+            Ok(SsTableScan::new(
+                stream,
+                projection_mask,
+                full_schema,
+                order,
+            ))
+        }
     }
 }
 

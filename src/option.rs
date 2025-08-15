@@ -87,6 +87,9 @@ pub struct DbOption {
 
     /// Parquet writer properties for on-disk SST files
     pub(crate) write_parquet_properties: WriterProperties,
+
+    /// Enable prefetch buffer for sequential access optimization
+    pub(crate) use_prefetch: bool,
 }
 
 impl DbOption {
@@ -125,6 +128,7 @@ impl DbOption {
             level_paths: vec![None; MAX_LEVEL],
             base_fs: FsOptions::Local,
             compaction_option: CompactionOption::Leveled,
+            use_prefetch: true, // Enable prefetch by default
         }
     }
 }
@@ -252,6 +256,17 @@ impl DbOption {
             ..self
         }
     }
+
+    /// Enable or disable prefetch buffer for sequential access optimization
+    ///
+    /// When enabled (default), the database will prefetch pages ahead of time during
+    /// sequential scans to improve I/O performance, especially for distributed storage.
+    pub fn use_prefetch(self, use_prefetch: bool) -> Self {
+        Self {
+            use_prefetch,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -319,6 +334,7 @@ impl Debug for DbOption {
             )
             .field("trigger_type", &self.trigger_type)
             .field("use_wal", &self.use_wal)
+            .field("use_prefetch", &self.use_prefetch)
             .field("write_parquet_properties", &self.write_parquet_properties)
             .finish()
     }
